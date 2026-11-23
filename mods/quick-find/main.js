@@ -15,7 +15,7 @@ function palette(t) {
 }
 
 const VIEWER = "file-viewer", OPEN = "file-viewer:open";
-const MAX_FILES = 20000, SHOW = 60, MAX_HITS = 200;
+const MAX_FILES = 100000, SHOW = 60, MAX_HITS = 200;
 const docKey = (file, on) => `${on ?? ""}|${file}`;
 const tabOf = (entry) => typeof entry === "string" ? entry : entry?.tab;
 const hasViewer = (tab) => panes().some(p => p.tab === tab && p.mod === VIEWER);
@@ -52,7 +52,12 @@ function score(path, tokens) {
   return total * 1000 - path.length;
 }
 
-const PS_LIST = "[Console]::OutputEncoding=[System.Text.UTF8Encoding]::new($false); & { param($p) Get-ChildItem -LiteralPath $p -Recurse -File -Force -Name -ErrorAction SilentlyContinue | Where-Object { $_ -notmatch '(^|\\\\)(node_modules|\\.git)(\\\\|$)' } | Select-Object -First 20001 } ";
+const PS_LIST = "[Console]::OutputEncoding=[System.Text.UTF8Encoding]::new($false); & { param($p) Get-ChildItem -LiteralPath $p -Recurse -File -Force -Name -ErrorAction SilentlyContinue | Where-Object { $_ -notmatch '(^|\\\\)(node_modules|\\.git)(\\\\|$)' } | Select-Object -First 100001 } ";
+
+// Text search with no ripgrep and no git (Windows): every file under the folder, any depth, minus
+// dependency/build folders and binary types. Case-insensitive, literal; the first 200 hits.
+const PS_GREP = "[Console]::OutputEncoding=[System.Text.UTF8Encoding]::new($false); & { param($p,$q) Get-ChildItem -LiteralPath $p -Recurse -File -Force -ErrorAction SilentlyContinue | Where-Object { $_.Length -lt 1MB -and $_.FullName -notmatch '[\\\\/](node_modules|\\.git|dist|build|\\.next|__pycache__|\\.venv|venv)[\\\\/]' -and $_.Extension -notmatch '^\\.(png|jpe?g|gif|webp|ico|pdf|zip|rar|7z|gz|exe|dll|bin|mp3|mp4|mov|avi|woff2?|ttf|otf|pyc|class|jar|iso|psd|docx?|xlsx?|pptx?|p12)$' } | Select-String -SimpleMatch -Pattern $q -ErrorAction SilentlyContinue | Select-Object -First 200 | ForEach-Object { $_.Path + ':' + $_.LineNumber + ':' + $_.Line } } ";
+const psq = (v) => "'" + String(v).replaceAll("'", "''") + "'";
 
 export default class QuickFind extends View {
   init(_props, cx) {
@@ -95,7 +100,7 @@ export default class QuickFind extends View {
         }
       } catch {}
       this.files = paths.filter(p => p && p !== ".git" && !p.startsWith(".git/")).slice(0, MAX_FILES);
-      this.status = `${this.files.length} files`;
+      this.status = paths.length > MAX_FILES ? `${MAX_FILES}+ files (list cut off)` : `${this.files.length} files`;
       this.changed(cx);
     });
   }
@@ -157,10 +162,12 @@ export default class QuickFind extends View {
     const opts = { cwd: this.root, on: this.on };
     if (this.engine === null) {
       const rg = await exec("rg", ["--version"], opts).catch(() => null);
-      this.engine = rg?.code === 0 ? "rg" : (await this.isGit()) ? "git" : "none";
+      this.engine = rg?.code === 0 ? "rg" : (await this.isGit()) ? "git" : (!this.on && window()?.platform === "windows") ? "ps" : "none";
     }
     if (this.engine === "none") { this.rows = []; this.status = "Text search needs ripgrep (rg) or a git repository"; return; }
-    const r = this.engine === "rg"
+    const r = this.engine === "ps"
+      ? await exec("powershell", ["-NoProfile", "-Command", PS_GREP + psq(this.root) + " " + psq(q)], { timeout: 90000 }).catch(() => null)
+      : this.engine === "rg"
       ? await exec("rg", ["--vimgrep", "--smart-case", "--fixed-strings", "--max-count", "5", "-g", "!.git", "--", q], opts).catch(() => null)
       : await exec("git", ["--no-optional-locks", "grep", "-n", "-I", "-i", "-F", "--untracked", "-e", q], opts).catch(() => null);
     if (seq !== this.seq) return;
@@ -168,7 +175,12 @@ export default class QuickFind extends View {
     for (const l of (r?.stdout ?? "").split(/\r?\n/)) {
       const m = this.engine === "rg" ? /^(.*?):(\d+):\d+:(.*)$/.exec(l) : /^(.*?):(\d+):(.*)$/.exec(l);
       if (!m) continue;
-      rows.push({ path: m[1].replaceAll("\\", "/"), line: Number(m[2]), text: m[3].trim().slice(0, 200) });
+      let path = m[1].replaceAll("\\", "/");
+      if (this.engine === "ps") {
+        const root = this.root.replaceAll("\\", "/").replace(/\/+$/, "");
+        if (path.toLowerCase().startsWith(root.toLowerCase() + "/")) path = path.slice(root.length + 1);
+      }
+      rows.push({ path, line: Number(m[2]), text: m[3].trim().slice(0, 200) });
       if (rows.length >= MAX_HITS) break;
     }
     this.rows = rows;
