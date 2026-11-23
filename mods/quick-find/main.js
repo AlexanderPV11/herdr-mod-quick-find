@@ -57,6 +57,13 @@ const PS_LIST = "[Console]::OutputEncoding=[System.Text.UTF8Encoding]::new($fals
 // Text search with no ripgrep and no git (Windows): every file under the folder, any depth, minus
 // dependency/build folders and binary types. Case-insensitive, literal; the first 200 hits.
 const PS_GREP = "[Console]::OutputEncoding=[System.Text.UTF8Encoding]::new($false); & { param($p,$q) Get-ChildItem -LiteralPath $p -Recurse -File -Force -ErrorAction SilentlyContinue | Where-Object { $_.Length -lt 1MB -and $_.FullName -notmatch '[\\\\/](node_modules|\\.git|dist|build|\\.next|__pycache__|\\.venv|venv)[\\\\/]' -and $_.Extension -notmatch '^\\.(png|jpe?g|gif|webp|ico|pdf|zip|rar|7z|gz|exe|dll|bin|mp3|mp4|mov|avi|woff2?|ttf|otf|pyc|class|jar|iso|psd|docx?|xlsx?|pptx?|p12)$' } | Select-String -SimpleMatch -Pattern $q -ErrorAction SilentlyContinue | Select-Object -First 200 | ForEach-Object { $_.Path + ':' + $_.LineNumber + ':' + $_.Line } } ";
+const BS = String.fromCharCode(92);
+const winPath = (v) => v.split("/").join(BS);
+const unixPath = (v) => v.split(BS).join("/");
+// Query words reduced to safe characters (they reach a SQL string and a cmd wildcard).
+const safeTok = (t) => [...t].filter((ch) => /[a-zA-Z0-9._-]/.test(ch) || ch.charCodeAt(0) > 127).join("");
+// Name search through the Windows Search index: instant on indexed folders, however big the tree.
+const PS_WS = (root, toks) => `[Console]::OutputEncoding=[System.Text.UTF8Encoding]::new($false); $c=New-Object -ComObject ADODB.Connection; $c.Open("Provider=Search.CollatorDSO;Extended Properties='Application=Windows';"); $r=${psq(root)}; $w=(${psq(toks.join("|"))}).Split("|") | ForEach-Object { "System.ItemPathDisplay LIKE '%" + $_ + "%'" }; $sql="SELECT TOP 500 System.ItemPathDisplay FROM SystemIndex WHERE SCOPE='file:" + $r + "' AND System.ItemType <> 'Directory' AND " + ($w -join " AND "); $rs=$c.Execute($sql); while(-not $rs.EOF){ $rs.Fields.Item(0).Value; $rs.MoveNext() }`;
 const psq = (v) => "'" + String(v).replaceAll("'", "''") + "'";
 
 export default class QuickFind extends View {
@@ -64,6 +71,7 @@ export default class QuickFind extends View {
     const loc = location();
     this.root = loc.cwd; this.on = loc.on;
     this.mode = "files"; this.files = null; this.rows = []; this.sel = 0;
+    this.demand = false; this.dirRun = false;
     this.status = "Loading files…"; this.engine = null; this.busy = false; this.timer = null; this.seq = 0;
     this.preview = null; this.pseq = 0; this.cache = new Map();
     this.scroll = ScrollHandle.new();
@@ -95,21 +103,33 @@ export default class QuickFind extends View {
           if (r?.stdout) paths = r.stdout.split("\0");
         }
         if (!paths.length && !this.on && window()?.platform === "windows") {
-          const r = await exec("powershell", ["-NoProfile", "-Command", PS_LIST + "'" + this.root.replaceAll("'", "''") + "'"]).catch(() => null);
-          if (r?.stdout) paths = r.stdout.split(/\r?\n/).map(p => p.replaceAll("\\", "/"));
+          const r = await exec("powershell", ["-NoProfile", "-Command", PS_LIST + "'" + this.root.replaceAll("'", "''") + "'"], { timeout: 10000 }).catch(() => null);
+          // Walking a huge tree takes minutes and gets cut off: search by name on demand instead.
+          if (r?.code === 0 && r.stdout) paths = r.stdout.split(/\r?\n/).map(p => p.replaceAll("\\", "/"));
+          if (!(r?.code === 0) || paths.length > MAX_FILES) { this.demand = true; paths = []; }
         }
       } catch {}
       this.files = paths.filter(p => p && p !== ".git" && !p.startsWith(".git/")).slice(0, MAX_FILES);
-      this.status = paths.length > MAX_FILES ? `${MAX_FILES}+ files (list cut off)` : `${this.files.length} files`;
+      this.status = this.demand ? "Type a name: searches every subfolder" : `${this.files.length} files`;
       this.changed(cx);
     });
   }
 
   changed(cx) {
     this.sel = 0;
-    if (this.mode === "files") { this.filter(); cx.notify(); return; }
     const q = this.input.value().trim();
+    if (this.mode === "files" && !this.demand) { this.filter(); cx.notify(); return; }
     this.timer?.cancel();
+    if (this.mode === "files") {
+      if (!q) { this.rows = []; this.status = "Type a name: searches every subfolder"; cx.notify(); return; }
+      this.status = "Searching…"; cx.notify();
+      const seq = ++this.seq;
+      this.timer = cx.timer.after(300, (cx) => {
+        this.timer = null;
+        cx.spawn(async (cx) => { await this.findNames(q, seq, cx); cx.notify(); });
+      });
+      return;
+    }
     if (!q) { this.rows = []; this.status = "Type to search file contents"; cx.notify(); return; }
     this.status = "Searching…"; cx.notify();
     const seq = ++this.seq;
@@ -117,6 +137,49 @@ export default class QuickFind extends View {
       this.timer = null;
       cx.spawn(async (cx) => { await this.grep(q, seq); this.loadPreview(cx); cx.notify(); });
     });
+  }
+
+  // On-demand file-name search for trees too big to list. The Windows Search index answers at
+  // once but misses what it has not indexed; a `dir /s` walk of the folder then completes the
+  // list (seconds to a minute). One walk at a time: the newest query waits its turn.
+  async findNames(q, seq, cx) {
+    const toks = q.toLowerCase().split(/\s+/).map(safeTok).filter(Boolean);
+    if (!toks.length) { this.rows = []; this.status = "No results"; return; }
+    let rootWin = winPath(this.root);
+    while (rootWin.length > 3 && rootWin.endsWith(BS)) rootWin = rootWin.slice(0, -1);
+    const base = unixPath(rootWin).toLowerCase() + "/";
+    const lines = (r) => (r?.stdout ?? "").split(/\r?\n/).filter(Boolean);
+    const found = new Map();
+    const merge = (paths) => {
+      for (const full of paths) {
+        let path = unixPath(full);
+        if (path.toLowerCase().startsWith(base)) path = path.slice(base.length);
+        const sc = score(path, toks);
+        if (sc >= 0) found.set(path.toLowerCase(), [sc, path]);
+      }
+      const all = [...found.values()].sort((x, y) => y[0] - x[0]);
+      this.rows = all.slice(0, SHOW).map(([, path]) => ({ path }));
+      return all.length;
+    };
+    const label = (n) => `${n} match${n === 1 ? "" : "es"}`;
+    const indexed = lines(await exec("powershell", ["-NoProfile", "-Command", PS_WS(rootWin, toks)], { timeout: 20000 }).catch(() => null));
+    if (seq !== this.seq) return;
+    let n = merge(indexed);
+    this.status = `${label(n)} · walking every folder…`;
+    cx.notify();
+    // The wildcard goes on the last word (the file name, in "folder file"); the rest filter the path.
+    const word = toks[toks.length - 1];
+    const job = { seq, run: async () => {
+      this.dirRun = true;
+      let out = [];
+      try { out = lines(await exec("cmd", ["/c", "dir", "/s", "/b", "/a-d", "*" + word + "*"], { cwd: this.root, timeout: 240000 }).catch(() => null)); }
+      finally { this.dirRun = false; }
+      if (seq === this.seq) { n = merge(out); this.status = n ? label(n) : "No results"; cx.notify(); }
+      const next = this.nextWalk; this.nextWalk = null;
+      if (next && next.seq === this.seq) await next.run();
+    } };
+    if (this.dirRun) { this.nextWalk = job; return; }
+    await job.run();
   }
 
   // Code preview around the selected/hovered text hit: the file read once (cached), a window of lines.
@@ -192,7 +255,8 @@ export default class QuickFind extends View {
     this.input.set_value("");
     this.input.focus();
     this.rows = []; this.sel = 0; this.preview = null; this.pseq++;
-    if (mode === "files") { this.status = this.files ? `${this.files.length} files` : "Loading files…"; this.filter(); }
+    if (mode === "files" && this.demand) this.status = "Type a name: searches every subfolder";
+    else if (mode === "files") { this.status = this.files ? `${this.files.length} files` : "Loading files…"; this.filter(); }
     else this.status = "Type to search file contents";
     cx.notify();
   }

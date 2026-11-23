@@ -16,6 +16,8 @@ Buscador tipo Ctrl+P / Ctrl+Shift+F para [Herdr](https://herdr.dev). Una tecla a
 | `git` | lista de archivos que respeta `.gitignore` y búsqueda de texto (`git grep`) | recomendado |
 | [`ripgrep`](https://github.com/BurntSushi/ripgrep) (`rg`) | búsqueda de texto más rápida y fuera de repos git | opcional |
 
+**Carpetas muy grandes (Windows).** Si listar la carpeta tarda más de 10 s (o pasa de `MAX_FILES`), Files deja de pre-listar y busca **según escribes** en todas las subcarpetas: primero consulta el índice de Windows Search (casi instantáneo, pero no incluye lo que aún no indexó) y en segundo plano un recorrido `dir /s` completa los resultados (de segundos a un minuto; la barra de estado dice «walking every folder…»). En ese modo la última palabra se usa como comodín del nombre y las demás filtran la ruta: escribe primero la carpeta y al final el archivo. En carpetas pequeñas y repos git sigue la lista instantánea con coincidencia difusa.
+
 Text elige su motor así: `rg` si está instalado; si no, `git grep` dentro de un repo git; si no, **en Windows una búsqueda con PowerShell** que recorre la carpeta y todas sus subcarpetas (ignora mayúsculas, omite `node_modules`, `.git`, `dist`, `build`, `.next`, `__pycache__`, `.venv`, `venv`, binarios comunes y archivos de más de 1 MB; máximo 200 resultados y 90 s). Es la más lenta: con `rg` va mucho más rápido. Files usa `git ls-files`, luego `rg --files` y, en Windows, PowerShell como último recurso.
 
 ## Instalación
